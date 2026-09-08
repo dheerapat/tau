@@ -6249,13 +6249,16 @@ class TauTuiApp(App[None]):
             moved = self.session.leave_provider(entry.name, persist_default=True)
             self.session.reload_provider_settings()
         except ProviderConfigError:
-            # No other configured provider is usable, so the session stays on
-            # the provider we just logged out of until /login runs.
-            self._notify(
-                f"Removed stored credentials for {entry.display_name}. "
-                "No other configured provider is usable; run /login to add one.",
-                severity="warning",
-            )
+            message = f"Removed stored credentials for {entry.display_name}."
+            if self.session.provider_name == entry.name:
+                # Nothing else is usable, so the session stays on the provider
+                # we just logged out of until /login runs.
+                message = (
+                    f"{message} No other configured provider is usable; run /login to add one."
+                )
+            else:
+                message = f"{message} Now using {self.session.provider_name}:{self.session.model}."
+            self._notify(message, severity="warning")
             self._refresh()
             return
         except Exception as exc:  # noqa: BLE001 - surface logout failures in the TUI

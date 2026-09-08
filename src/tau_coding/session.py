@@ -2505,8 +2505,10 @@ class CodingSession:
             self._refresh_runtime_provider()
             self._sync_image_support()
         except ProviderConfigError:
+            active = self._active_provider_config()
             fallback = self._usable_fallback_choice(self._provider_name)
-            if fallback is None:
+            lost_credentials = active is not None and not self._provider_is_usable(active)
+            if fallback is None or not lost_credentials:
                 self._provider_settings = previous_settings
                 self._durable_provider_settings = previous_durable_settings
                 self._thinking_level = previous_thinking_level
@@ -2514,11 +2516,17 @@ class CodingSession:
             # The active provider lost its credentials (for example after
             # /logout), so staying on it would break /model, /login, and every
             # later refresh. Move to a provider Tau can still call.
-            self._set_provider_model(
-                fallback.provider_name,
-                fallback.model,
-                persist_default=False,
-            )
+            try:
+                self._set_provider_model(
+                    fallback.provider_name,
+                    fallback.model,
+                    persist_default=False,
+                )
+            except ProviderConfigError:
+                self._provider_settings = previous_settings
+                self._durable_provider_settings = previous_durable_settings
+                self._thinking_level = previous_thinking_level
+                raise
 
     def _usable_fallback_choice(self, excluded_provider: str) -> ModelChoice | None:
         """Return a usable provider/model choice other than ``excluded_provider``."""
