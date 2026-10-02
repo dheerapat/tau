@@ -6,9 +6,17 @@ import html
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Literal
 
-from tau_agent.messages import AssistantMessage
-from tau_agent.session import CompactionEntry, MessageEntry, SessionEntry
+from tau_agent.messages import AssistantMessage, Usage
+from tau_agent.session import (
+    BranchSummaryEntry,
+    CompactionEntry,
+    MessageEntry,
+    ModelChangeEntry,
+    SessionEntry,
+    ThinkingLevelChangeEntry,
+)
 from tau_coding.provider_catalog import builtin_provider_entry, model_cost_for_input_tokens
 from tau_coding.session_stats import _response_cost
 from tau_coding.tui.themes import TAU_DARK_THEME, TAU_LIGHT_THEME
@@ -16,6 +24,7 @@ from tau_coding.tui.themes import TAU_DARK_THEME, TAU_LIGHT_THEME
 __all__ = [
     "RequestUsage",
     "SessionUsage",
+    "UsageEvent",
     "USAGE_SCRIPT",
     "USAGE_STYLES",
     "collect_session_usage",
@@ -28,6 +37,7 @@ class RequestUsage:
     """Token usage for a single assistant response."""
 
     number: int
+    kind: str
     timestamp: str
     provider: str
     model: str
@@ -51,12 +61,24 @@ class RequestUsage:
 
 
 @dataclass(frozen=True, slots=True)
+class UsageEvent:
+    """A notable session event positioned against the next model request."""
+
+    request_number: int
+    timestamp: str
+    kind: str
+    label: str
+    position: Literal["before", "after"] = "before"
+
+
+@dataclass(frozen=True, slots=True)
 class SessionUsage:
     """Aggregated usage for the entries shown in an export."""
 
     requests: tuple[RequestUsage, ...]
     tool_calls: tuple[tuple[str, int], ...]
     compactions: int
+    events: tuple[UsageEvent, ...] = ()
 
     @property
     def total_fresh(self) -> int:
@@ -124,26 +146,29 @@ def estimated_request_cost(
 
 
 def collect_session_usage(entries: Sequence[SessionEntry]) -> SessionUsage:
-    """Collect per-request token usage, tool-call counts, and compactions."""
+    """Collect per-request token usage, tool-call counts, and notable events."""
     requests: list[RequestUsage] = []
     tools: dict[str, int] = {}
     compactions = 0
-    for entry in entries:
-        if isinstance(entry, CompactionEntry):
-            compactions += 1
-            continue
-        if not isinstance(entry, MessageEntry):
-            continue
-        message = entry.message
-        if not isinstance(message, AssistantMessage):
-            continue
-        for call in message.tool_calls:
-            tools[call.name] = tools.get(call.name, 0) + 1
-        usage = message.usage
+    pending_events: list[tuple[str, str, str]] = []
+    events: list[UsageEvent] = []
+    current_provider = "unknown"
+    current_model = "unknown"
+
+    def append_request(
+        usage: Usage,
+        *,
+        timestamp: float,
+        kind: str,
+        provider: str,
+        model: str,
+        response_provider: str | None = None,
+        stop_reason: str = "-",
+    ) -> None:
         cache_write_1h = usage.cache_write_1h or 0
         estimated = estimated_request_cost(
-            message.provider,
-            message.model,
+            provider,
+            model,
             fresh=usage.input,
             cached=usage.cache_read,
             cache_write=usage.cache_write,
@@ -152,25 +177,128 @@ def collect_session_usage(entries: Sequence[SessionEntry]) -> SessionUsage:
         )
         if estimated is None and usage.cost.total > 0:
             estimated = usage.cost.total
+        request_number = len(requests) + 1
         requests.append(
             RequestUsage(
-                number=len(requests) + 1,
-                timestamp=datetime.fromtimestamp(entry.timestamp, tz=UTC).strftime("%H:%M:%S"),
-                provider=message.provider,
-                model=message.model,
-                response_provider=message.response_provider,
+                number=request_number,
+                kind=kind,
+                timestamp=_entry_time(timestamp),
+                provider=provider,
+                model=model,
+                response_provider=response_provider,
                 fresh=usage.input,
                 cached=usage.cache_read,
                 cache_write=usage.cache_write,
                 cache_write_1h=cache_write_1h,
                 output=usage.output,
                 reasoning=usage.reasoning or 0,
-                stop_reason=message.stop_reason,
+                stop_reason=stop_reason,
                 estimated_cost=estimated,
             )
         )
+        events.extend(
+            UsageEvent(
+                request_number=request_number,
+                timestamp=event_timestamp,
+                kind=event_kind,
+                label=label,
+            )
+            for event_timestamp, event_kind, label in pending_events
+        )
+        pending_events.clear()
+
+    for entry in entries:
+        event = _usage_event(entry)
+        if isinstance(entry, CompactionEntry):
+            compactions += 1
+            if entry.usage is not None:
+                append_request(
+                    entry.usage,
+                    timestamp=entry.timestamp,
+                    kind="compaction summary",
+                    provider=entry.provider or current_provider,
+                    model=entry.model or current_model,
+                    response_provider=entry.response_provider,
+                )
+            if event is not None:
+                kind, label = event
+                pending_events.append((_entry_time(entry.timestamp), kind, label))
+            continue
+        if isinstance(entry, BranchSummaryEntry):
+            if entry.usage is not None:
+                append_request(
+                    entry.usage,
+                    timestamp=entry.timestamp,
+                    kind="branch summary",
+                    provider=entry.provider or current_provider,
+                    model=entry.model or current_model,
+                    response_provider=entry.response_provider,
+                )
+            if event is not None:
+                kind, label = event
+                pending_events.append((_entry_time(entry.timestamp), kind, label))
+            continue
+        if event is not None:
+            kind, label = event
+            pending_events.append((_entry_time(entry.timestamp), kind, label))
+        if isinstance(entry, ModelChangeEntry):
+            current_model = entry.model
+            if entry.provider is not None:
+                current_provider = entry.provider
+            continue
+        if not isinstance(entry, MessageEntry):
+            continue
+        message = entry.message
+        if not isinstance(message, AssistantMessage):
+            continue
+        current_provider = message.provider
+        current_model = message.model
+        for call in message.tool_calls:
+            tools[call.name] = tools.get(call.name, 0) + 1
+        append_request(
+            message.usage,
+            timestamp=entry.timestamp,
+            kind="assistant",
+            provider=message.provider,
+            model=message.model,
+            response_provider=message.response_provider,
+            stop_reason=message.stop_reason,
+        )
+    if requests:
+        events.extend(
+            UsageEvent(
+                request_number=len(requests),
+                timestamp=timestamp,
+                kind=kind,
+                label=label,
+                position="after",
+            )
+            for timestamp, kind, label in pending_events
+        )
     ordered_tools = tuple(sorted(tools.items(), key=lambda item: (-item[1], item[0])))
-    return SessionUsage(requests=tuple(requests), tool_calls=ordered_tools, compactions=compactions)
+    return SessionUsage(
+        requests=tuple(requests),
+        tool_calls=ordered_tools,
+        compactions=compactions,
+        events=tuple(events),
+    )
+
+
+def _entry_time(timestamp: float) -> str:
+    return datetime.fromtimestamp(timestamp, tz=UTC).strftime("%H:%M:%S")
+
+
+def _usage_event(entry: SessionEntry) -> tuple[str, str] | None:
+    """Return chart metadata for session events that can affect prompt usage."""
+    if isinstance(entry, CompactionEntry):
+        return "compaction", "Compaction"
+    if isinstance(entry, ModelChangeEntry):
+        return "model", f"Model changed to {entry.model}"
+    if isinstance(entry, ThinkingLevelChangeEntry):
+        return "thinking", f"Thinking changed to {entry.thinking_level or 'off'}"
+    if isinstance(entry, BranchSummaryEntry):
+        return "branch", "Branch summary"
+    return None
 
 
 _SERIES_COLORS = {
@@ -185,6 +313,7 @@ _SERIES_COLORS = {
         TAU_LIGHT_THEME.role_styles["branch_summary"].border,
     ),
     "reasoning": (TAU_DARK_THEME.success, TAU_LIGHT_THEME.success),
+    "event": (TAU_DARK_THEME.markdown_bullet, TAU_LIGHT_THEME.markdown_bullet),
 }
 
 
@@ -218,6 +347,7 @@ def _line_chart(
     y_max: float | None = None,
     percent: bool = False,
     timestamps: Sequence[str] | None = None,
+    events: Sequence[UsageEvent] = (),
 ) -> str:
     """Render one interactive line chart as inline SVG."""
     width, height = 900, 330
@@ -263,6 +393,25 @@ def _line_chart(
         f'<line class="hover-line" x1="{left}" y1="{top}" x2="{left}" '
         f'y2="{top + plot_height}" visibility="hidden"/>'
     )
+    event_dark, event_light = _series_color_pair("event")
+    for event_index, event in enumerate(events):
+        x, _ = point(max(0, min(count - 1, event.request_number - 1)), 0)
+        marker_y = top + 7 + (event_index % 3) * 9
+        description = (
+            f"{event.label} {event.position} request {event.request_number} at {event.timestamp}"
+        )
+        parts.append(
+            f'<g class="usage-event usage-event-{html.escape(event.kind, quote=True)}" '
+            f'data-request="{event.request_number}" '
+            f'data-event-info="{html.escape(description, quote=True)}" '
+            f'role="img" aria-label="{html.escape(description, quote=True)}">'
+            f"<title>{html.escape(description)}</title>"
+            f'<line class="event-line" data-dark="{event_dark}" data-light="{event_light}" '
+            f'x1="{x:.1f}" y1="{top}" x2="{x:.1f}" y2="{top + plot_height}" '
+            f'stroke="{event_dark}"/>'
+            f'<circle class="event-marker" data-dark="{event_dark}" data-light="{event_light}" '
+            f'cx="{x:.1f}" cy="{marker_y:.1f}" r="4" fill="{event_dark}"/></g>'
+        )
     for series_index, (name, values) in enumerate(series):
         dark, light = _series_color_pair(name)
         points = " ".join(
@@ -352,6 +501,7 @@ def render_usage_dashboard(usage: SessionUsage) -> str:
             "Prompt input by request",
             [("cached", cached), ("cache writes", cache_writes), ("fresh", fresh)],
             timestamps=timestamps,
+            events=usage.events,
         )
     ]
     if cache_hit_rate is not None:
@@ -375,8 +525,8 @@ def render_usage_dashboard(usage: SessionUsage) -> str:
     show_hit_rates = cache_hit_rate is not None
 
     table_rows = "".join(
-        f"<tr><td>{item.number}</td><td>{html.escape(item.timestamp)}</td>"
-        f"<td>{html.escape(item.provider)}</td>"
+        f"<tr><td>{item.number}</td><td>{html.escape(item.kind)}</td>"
+        f"<td>{html.escape(item.timestamp)}</td><td>{html.escape(item.provider)}</td>"
         f"<td>{html.escape(item.response_provider) if item.response_provider else '-'}</td>"
         f"<td>{html.escape(item.model)}</td><td>{item.fresh:,}</td><td>{item.cached:,}</td>"
         f"<td>{item.cache_write:,}</td><td>{item.prompt:,}</td>"
@@ -399,11 +549,12 @@ def render_usage_dashboard(usage: SessionUsage) -> str:
         '<p class="usage-note">Costs use Tau\'s provider catalog rates. OAuth subscription '
         "estimates are API-rate equivalents, not actual subscription charges. Hover a request "
         "for exact values, select a legend item to hide a series, and use PNG to save a "
-        "chart.</p>"
+        "chart. Event markers show compactions, model or thinking changes, and branch summaries."
+        "</p>"
         f'<div class="usage-charts">{charts_html}</div>'
         '<div class="usage-details">'
         '<div class="usage-panel"><h2>Requests</h2><div class="usage-table-wrap"><table>'
-        "<thead><tr><th>#</th><th>Time</th><th>Provider</th>"
+        "<thead><tr><th>#</th><th>Request</th><th>Time</th><th>Provider</th>"
         "<th>Response Provider</th><th>Model</th><th>Fresh</th>"
         "<th>Cached</th>"
         "<th>Written</th><th>Prompt</th><th>Hit rate</th><th>Output</th><th>Est. cost</th>"
@@ -514,6 +665,9 @@ USAGE_STYLES = """
       stroke-dasharray: 3 4;
       pointer-events: none;
     }
+    .event-line { stroke-width: 1.5; stroke-dasharray: 5 4; opacity: .8; }
+    .event-marker { stroke: var(--surface); stroke-width: 2; }
+    .usage-event:hover .event-line, .usage-event:hover .event-marker { opacity: 1; }
     .hover-point { stroke: var(--surface); stroke-width: 2; pointer-events: none; }
     .series { transition: opacity .15s ease; }
     .series.is-hidden { opacity: .07; pointer-events: none; }
@@ -582,10 +736,10 @@ USAGE_STYLES = """
       text-transform: uppercase;
       border-bottom: 1px solid var(--line-strong);
     }
-    .usage-panel th:nth-child(3), .usage-panel th:nth-child(4),
-    .usage-panel th:nth-child(5),
-    .usage-panel td:nth-child(3), .usage-panel td:nth-child(4),
-    .usage-panel td:nth-child(5) { text-align: left; }
+    .usage-panel th:nth-child(2), .usage-panel th:nth-child(4),
+    .usage-panel th:nth-child(5), .usage-panel th:nth-child(6),
+    .usage-panel td:nth-child(2), .usage-panel td:nth-child(4),
+    .usage-panel td:nth-child(5), .usage-panel td:nth-child(6) { text-align: left; }
     .usage-tool {
       display: flex;
       justify-content: space-between;
@@ -616,7 +770,8 @@ USAGE_SCRIPT = """
           var colored = chart.querySelectorAll("[data-dark][data-light]");
           Array.prototype.forEach.call(colored, function (node) {
             var color = dark ? node.dataset.dark : node.dataset.light;
-            if (node.tagName.toLowerCase() === "polyline") {
+            var tagName = node.tagName.toLowerCase();
+            if (tagName === "polyline" || tagName === "line") {
               node.setAttribute("stroke", color);
             } else {
               node.setAttribute("fill", color);
@@ -676,6 +831,10 @@ USAGE_SCRIPT = """
             var labels = (series.dataset.labels || "").split("|");
             tooltipLines.push(series.dataset.name + "  " + labels[index]);
           });
+          chart.querySelectorAll('.usage-event[data-request="' + (index + 1) + '"]')
+            .forEach(function (sessionEvent) {
+              tooltipLines.push("Event  " + sessionEvent.dataset.eventInfo);
+            });
           var x = activeSeries[0].querySelector(".hover-point").getAttribute("cx");
           var line = chart.querySelector(".hover-line");
           line.setAttribute("x1", x);
@@ -751,7 +910,8 @@ USAGE_SCRIPT = """
           node.remove();
         });
         clone.querySelectorAll("[data-light]").forEach(function (node) {
-          if (node.tagName.toLowerCase() === "polyline") {
+          var tagName = node.tagName.toLowerCase();
+          if (tagName === "polyline" || tagName === "line") {
             node.setAttribute("stroke", node.dataset.light);
           } else {
             node.setAttribute("fill", node.dataset.light);

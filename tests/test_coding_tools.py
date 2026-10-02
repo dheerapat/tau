@@ -13,6 +13,7 @@ from tau_coding import (
     ImageSupportState,
     ReadOperations,
     create_bash_tool,
+    create_bash_tool_definition,
     create_coding_tools,
     create_edit_tool,
     create_edit_tool_definition,
@@ -55,6 +56,17 @@ async def test_create_coding_tools_returns_initial_tool_set(tmp_path: Path) -> N
     edit_tool = tools[2]
     assert edit_tool.prompt_snippet is not None
     assert "Use edit for precise changes" in edit_tool.prompt_guidelines[0]
+    assert "present-participle description" in tools[3].prompt_guidelines[0]
+
+
+def test_bash_tool_schema_requires_display_description(tmp_path: Path) -> None:
+    definition = create_bash_tool_definition(cwd=tmp_path)
+    properties = definition.input_schema["properties"]
+
+    assert isinstance(properties, dict)
+    assert properties["description"]["type"] == "string"
+    assert "present-participle summary" in properties["description"]["description"]
+    assert definition.input_schema["required"] == ["command", "description"]
 
 
 def test_tool_definitions_expose_pi_style_prompt_metadata(tmp_path: Path) -> None:
@@ -345,7 +357,7 @@ async def test_edit_tool_requires_unique_matches(tmp_path: Path) -> None:
 
 
 @pytest.mark.anyio
-async def test_bash_tool_captures_stdout_and_exit_code(tmp_path: Path) -> None:
+async def test_bash_tool_tolerates_missing_required_display_description(tmp_path: Path) -> None:
     tool = create_bash_tool(cwd=tmp_path)
 
     result = await tool.execute("test-call", {"command": "printf hello"})
@@ -355,6 +367,35 @@ async def test_bash_tool_captures_stdout_and_exit_code(tmp_path: Path) -> None:
     assert result.details is not None
     assert result.details["exit_code"] == 0
     assert result.details["timed_out"] is False
+
+
+@pytest.mark.anyio
+async def test_bash_tool_disconnects_stdin_from_commands(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    subprocess_options: dict[str, object] = {}
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, None]:
+            return b"", None
+
+    async def fake_create_subprocess_shell(
+        command: str,
+        **options: object,
+    ) -> FakeProcess:
+        del command
+        subprocess_options.update(options)
+        return FakeProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_shell", fake_create_subprocess_shell)
+    tool = create_bash_tool(cwd=tmp_path)
+
+    await tool.execute("test-call", {"command": "python"})
+
+    assert subprocess_options["stdin"] == asyncio.subprocess.DEVNULL
 
 
 @pytest.mark.anyio

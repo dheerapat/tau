@@ -5,6 +5,8 @@ from pathlib import Path
 from tau_agent import (
     AssistantMessage,
     CompactionEntry,
+    CustomMessageEntry,
+    LabelEntry,
     LeafEntry,
     MessageEntry,
     ModelChangeEntry,
@@ -51,9 +53,10 @@ def test_render_session_html_preserves_branch_tree() -> None:
             id="compact",
             parent_id="tool",
             summary="The right branch was compacted.",
-            replaces_entry_ids=["root", "right", "tool"],
+            first_kept_entry_id="tool",
+            usage=Usage(input=100, output=10, cache_read=20),
         ),
-        LeafEntry(id="leaf", parent_id="compact", entry_id="compact"),
+        LeafEntry(id="leaf", parent_id="compact", entry_id="left"),
     ]
 
     html = render_session_html(entries, title="Test Export", source="/tmp/session.jsonl")
@@ -63,12 +66,65 @@ def test_render_session_html_preserves_branch_tree() -> None:
     assert 'id="entry-root"' in html
     assert 'id="entry-left"' in html
     assert 'id="entry-right"' in html
-    assert 'id="entry-compact"' in html
+    assert 'id="entry-compact" class="entry active-entry"' in html
+    assert 'id="entry-leaf" class="entry"' in html
     assert "Start &lt;session&gt;" in html
     assert "Right branch" in html
     assert "active-path" in html
     assert "active-leaf" in html
-    assert "Replaces entries" in html
+    assert "First kept entry" in html
+    assert "<code>tool</code>" in html
+    assert "Replaces entries" not in html
+    assert "Summary request usage" in html
+    assert "cacheRead" in html
+    assert "compaction summary" in html
+
+
+def test_render_session_html_resolves_bookmark_labels_on_tree_nodes() -> None:
+    entries = [
+        MessageEntry(id="root", message=UserMessage(content="Start")),
+        LabelEntry(
+            id="set",
+            parent_id="root",
+            target_id="root",
+            label="important <checkpoint>",
+        ),
+    ]
+
+    html = render_session_html(entries)
+
+    assert '<span class="bookmark-label">[important &lt;checkpoint&gt;]</span>' in html
+    assert 'aria-label="[important &lt;checkpoint&gt;] user: Start"' in html
+    assert "Set bookmark to <strong>important &lt;checkpoint&gt;</strong>" in html
+    assert 'href="#entry-root"' in html
+
+
+def test_render_session_html_handles_long_legacy_leaf_history() -> None:
+    entries: list[MessageEntry | LeafEntry] = []
+    parent_id: str | None = None
+    for index in range(1_100):
+        message = MessageEntry(
+            id=f"message-{index}",
+            parent_id=parent_id,
+            message=UserMessage(content=f"Message {index}"),
+        )
+        entries.extend(
+            [
+                message,
+                LeafEntry(
+                    id=f"leaf-{index}",
+                    parent_id=message.id,
+                    entry_id=message.id,
+                ),
+            ]
+        )
+        parent_id = message.id
+
+    html = render_session_html(entries, title="Legacy session")
+
+    assert 'id="entry-message-1099"' in html
+    assert 'id="entry-leaf-1099"' in html
+    assert 'href="#entry-leaf-1099"' not in html
 
 
 def test_render_session_html_uses_static_document_layout() -> None:
@@ -218,6 +274,45 @@ def test_render_session_html_marks_error_tool_results() -> None:
     assert '<span class="error-flag">error</span>' in html
 
 
+def test_render_session_html_honors_custom_message_display() -> None:
+    entries = [
+        CustomMessageEntry(
+            id="visible",
+            custom_type="extension:status",
+            content="visible context",
+            details={"job": 1},
+        ),
+        CustomMessageEntry(
+            id="hidden",
+            parent_id="visible",
+            custom_type="extension:secret",
+            content="hidden context marker",
+            display=False,
+        ),
+        MessageEntry(
+            id="reply",
+            parent_id="hidden",
+            message=AssistantMessage(content="continued"),
+        ),
+    ]
+
+    html = render_session_html(entries)
+
+    assert 'id="entry-visible"' in html
+    assert "Custom message: extension:status" in html
+    assert "visible context" in html
+    assert 'id="entry-hidden"' not in html
+    assert "hidden context marker" not in html
+    assert 'id="entry-reply"' in html
+    assert '<span>parent <a href="#entry-visible"><code>visible</code></a></span>' in html
+    encoded = re.search(
+        r'<script id="sessionJsonlData" type="application/octet-stream">([^<]*)</script>',
+        html,
+    )
+    assert encoded is not None
+    assert "hidden context marker" in base64.b64decode(encoded.group(1)).decode("utf-8")
+
+
 def test_render_session_html_includes_jsonl_download() -> None:
     entries = [
         MessageEntry(id="root", message=UserMessage(content="Hello")),
@@ -242,7 +337,7 @@ def test_render_session_html_includes_jsonl_download() -> None:
     assert match is not None
     decoded = base64.b64decode(match.group(1)).decode("utf-8")
     lines = decoded.splitlines()
-    # The download embeds every entry, including leaf pointers filtered from the view,
+    # The download embeds every entry, including historical leaf pointers,
     # but keeps the live prompt outside persisted transcript data.
     assert len(lines) == 3
     assert '"id":"leaf"' in lines[2]
@@ -296,17 +391,17 @@ def test_render_session_html_includes_usage_tab() -> None:
 
     html = render_session_html(entries, title="Usage Export")
 
-    assert 'id="panel-cache"' in html
+    assert 'id="panel-usage"' in html
     assert 'class="usage-chart"' in html
     assert 'class="png-button"' in html
     assert "Cache hit rate" in html
     assert "Estimated cost" in html
     # Tabs use focusable buttons and implement the ARIA keyboard interaction.
-    assert '<button\n        type="button"\n        class="tab"\n        id="tab-cache"' in html
+    assert '<button\n        type="button"\n        class="tab"\n        id="tab-usage"' in html
     assert 'event.key !== "ArrowLeft" && event.key !== "ArrowRight"' in html
     assert "tabs[next].focus()" in html
-    assert 'currentHash === "#transcript" || currentHash === "#cache"' in html
-    assert 'selectTab(window.location.hash === "#cache" ? 1 : 0, false)' in html
+    assert 'currentHash === "#usage" || currentHash === "#cache"' in html
+    assert 'window.location.hash === "#usage" || window.location.hash === "#cache"' in html
 
 
 def test_render_session_html_uses_tau_theme_palette() -> None:
@@ -326,7 +421,7 @@ def test_render_session_html_uses_tau_theme_palette() -> None:
     assert f"--bg: {TAU_LIGHT_THEME.screen_background}" in html
     assert f"--bg: {TAU_DARK_THEME.screen_background}" in html
     assert ":root.theme-dark" in html
-    assert 'id="tab-cache"' in html
+    assert 'id="tab-usage"' in html
     assert "tau-themechange" in html
     assert f'data-dark="{TAU_DARK_THEME.error}"' in html
     assert f'data-light="{TAU_LIGHT_THEME.error}"' in html
