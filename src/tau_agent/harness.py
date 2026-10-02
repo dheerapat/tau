@@ -9,13 +9,13 @@ from dataclasses import dataclass, field
 from inspect import isawaitable
 from typing import Literal
 
+from tau_agent.events import AgentEvent, MessageEndEvent, MessageStartEvent
 from tau_agent.loop import (
     AfterToolCall,
     BeforeToolCall,
     TurnRenderer,
     run_agent_loop,
 )
-from tau_agent.events import AgentEvent, MessageEndEvent, MessageStartEvent
 from tau_agent.messages import (
     AgentMessage,
     AssistantMessage,
